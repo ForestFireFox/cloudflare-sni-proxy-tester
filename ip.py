@@ -13,7 +13,7 @@ DEFAULT_CONFIG_FILE = "./config.ini"
 token = ""       # ipinfo token
 downloadBytes = 1024 * 1024 * 20
 previousCountry = "HK"
-hops = 20
+hops = 40
 
 DEFAULT_INPUT = "./ip.csv"
 DEFAULT_IP_OUTPUT = "./ip.txt"
