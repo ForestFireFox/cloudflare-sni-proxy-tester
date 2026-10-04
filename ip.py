@@ -63,11 +63,34 @@ HIGH_END_ROUTE_NAMES = {"CN2", "CMIN2"}
 HIGH_END_ASNS = {"4809", "9929", "9808"}
 ROUTE_PRIORITY = {"Unknown": 0, "163": 60, "169": 70, "ANet": 80,
                   "CMI": 80, "CN2": 100, "CMIN2": 100}
+MAINLAND_CN_CODES = {"CN"}
+
+# 机场三字码 → 国家/地区二字符代码、城市（用于 CSV 输出）
+COLO_COUNTRY_MAP = {
+    "AMS":"NL","ARN":"SE","ATH":"GR","ATL":"US","AKL":"NZ","BCN":"ES","BNE":"AU",
+    "BOM":"IN","BOS":"US","BRU":"BE","BUD":"HU","BUF":"US","CAI":"EG","CBR":"AU",
+    "CDG":"FR","CGK":"ID","CLT":"US","CNS":"AU","CPH":"DK","CPT":"ZA","CUR":"CW",
+    "DAR":"TZ","DEL":"IN","DEN":"US","DFW":"US","DME":"RU","DOH":"QA","DTW":"US",
+    "DUB":"IE","DUS":"DE","EWR":"US","EZE":"AR","FCO":"IT","FRA":"DE","GIG":"BR",
+    "GRU":"BR","GVA":"CH","HAM":"DE","HEL":"FI","HKG":"HK","HND":"JP","IAD":"US",
+    "IAH":"US","ICN":"KR","IND":"US","IST":"TR","JAX":"US","JNB":"ZA","KIX":"JP",
+    "KUL":"MY","LAS":"US","LAX":"US","LHR":"GB","LIM":"PE","LIS":"PT","LOS":"NG",
+    "MAD":"ES","MAN":"GB","MEL":"AU","MEX":"MX","MIA":"US","MSP":"US","MUC":"DE",
+    "MXP":"IT","NRT":"JP","ORD":"US","ORF":"US","OSL":"NO","OTP":"RO","PDX":"US",
+    "PER":"AU","PHL":"US","PHX":"US","PRG":"CZ","QRO":"MX","RIX":"LV","SAN":"US",
+    "SCL":"CL","SEA":"US","SIN":"SG","SJC":"US","SLC":"US","SOF":"BG","STL":"US",
+    "SYD":"AU","TLV":"IL","TPA":"US","TXL":"DE","VIE":"AT","VNO":"LT","WAW":"PL",
+    "YUL":"CA","YVR":"CA","YYZ":"CA","ZRH":"CH",
+}
+
 COLO_CITY_MAP = {"NRT":"Tokyo","KIX":"Osaka","LAX":"Los Angeles","SJC":"San Jose",
                  "SEA":"Seattle","DFW":"Dallas","IAD":"Washington","ORD":"Chicago",
                  "MIA":"Miami","SIN":"Singapore","AMS":"Amsterdam","FRA":"Frankfurt",
                  "LHR":"London","HKG":"Hong Kong"}
-MAINLAND_CN_CODES = {"CN"}
+
+def colo_to_country(colo):
+    """机场三字码 → 国家二字符代码；未知返回空字符串。"""
+    return COLO_COUNTRY_MAP.get((colo or "").upper(), "")
 
 # ==================== 线程安全状态 ====================
 print_lock = threading.Lock()
@@ -1037,7 +1060,10 @@ def outputs(results, outtxt, outcsv, only_best):
         w = csv.writer(f)
         w.writerow(["route", "ip", "cfcountry", "tour", "country", "city", "speed", "latency"])
         for r in results:
-            w.writerow([r.get("route", ""), r["ip"], r.get("cfcountry", ""),
+            # cfcountry 改为由 colo（机场三字码）映射得到的国家二字符代码，
+            # 映射不到时回退到 trace 返回的 loc，避免出现空值。
+            cfcountry = colo_to_country(r.get("colo")) or r.get("cfcountry", "")
+            w.writerow([r.get("route", ""), r["ip"], cfcountry,
                         r.get("tour", "None"), r.get("country", ""), r.get("city", ""),
                         fmt_speed(r["speed"]), fmt_latency(r["latency"])])
     log(f"[*] CSV已保存：{outcsv}")
