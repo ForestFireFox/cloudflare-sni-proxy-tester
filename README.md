@@ -59,7 +59,6 @@ curl -w %{speed_download} ... {large-file-url}
 
 表头字段注释：
 - ip：ip
-- country：访问/cdn-cgi/trace对应的国家/地区代码，该字段可以填充HK等。
 - country：colo映射的国家
 - city：colo映射的城市
 - speed：这个ip的速度
