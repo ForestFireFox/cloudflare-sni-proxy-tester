@@ -26,7 +26,6 @@ OS: Windows or Ubuntu（未测试）
 **优先级：命令行给予 > config.ini > 脚本内置默认配置**
 
 - -threads “测试延迟、速度”的线程数，默认2，填max时就取config.ini中的max值。
-- -i 输入文件，没填默认./ip.csv
 - -o csv输出，没填从config.ini中获取。（这里不支持{date}{num}等映射，ip.txt输出不支持关闭。）
 - -d 测速文件大小，计数单位：**MB**。
 - -config 后面跟配置文件路径，例如config.ini（代表./config.ini）
@@ -44,8 +43,10 @@ ping ... {your-ip} 解析返回延迟
 curl -w %{speed_download} ... {large-file-url}
 
 ## ip.txt 输出结果示例
+```text
 1.2.3.4#🇯🇵 Tokyo 1
 5.6.7.8#🇯🇵 Tokyo 2
+```
 
 ## csv输出示例
 
