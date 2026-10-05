@@ -70,8 +70,10 @@ traceroute/tracert/tracepath {your-ip}
 （ip列必须存在，存在其他输入也无所谓。）
 
 ## ip.txt 输出结果示例
+```text
 1.2.3.4#JP (CN2) Tokyo 1 //电信示例1
-5.6.7.8#JP (163绕HK、US) Tokyo 2 //电信示例2
+5.6.7.8#JP (163绕🇭🇰、🇺🇸) Tokyo 2 //电信示例2
+```
 
 ## csv输出示例
 | route | ip          | cfcountry | tour  | country | city      | speed    | latency |
@@ -87,9 +89,9 @@ traceroute/tracert/tracepath {your-ip}
 表头字段注释：
 route：判断的线路类型
 ip：ip
-cfcountry：访问/cdn-cgi/trace对应的国家/地区代码，该字段可以填充HK。
+cfcountry：数据中心colo映射出的国家代码。
 tour：绕路情况，没绕填充None，绕路按照上述格式填充，例：HK→JP
 country：这个ip本身对应的国家
 city：这个ip对应的城市
 speed：这个ip的速度
-delay：这个ip的延迟
+latency：这个ip的延迟
