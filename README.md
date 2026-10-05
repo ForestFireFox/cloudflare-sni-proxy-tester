@@ -87,10 +87,10 @@ traceroute/tracert/tracepath {your-ip}
 排列优先级：previousCountry对应的国家 -> 速度降序；把cfcountry一致的ip归类到了一块排序
 
 表头字段注释：
-route：判断的线路类型
-ip：ip
-cfcountry：数据中心colo映射出的国家代码。
-tour：绕路情况，没绕填充None，绕路按照上述格式填充，例：HK→JP
+- route：判断的线路类型
+- ip：ip
+- cfcountry：数据中心colo映射出的国家代码。
+- tour：绕路情况，没绕填充None，绕路按照上述格式填充，例：HK→JP
 country：这个ip本身对应的国家
 city：这个ip对应的城市
 speed：这个ip的速度
