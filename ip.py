@@ -15,6 +15,7 @@ import os
 import platform
 import random
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -48,12 +49,25 @@ SPEED_TEST_URL = "https://speed.cloudflare.com/__down?during=download&bytes={byt
 AVAILABILITY_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 AVAILABILITY_HOST = "www.cloudflare.com"
 
-PING_COUNT = 4
-PING_TIMEOUT_SEC = 2
+# 延迟测试：TCP 三次握手（默认）或 ICMP（ping），由 LATENCY_METHOD 切换
+# PING_COUNT / PING_TIMEOUT_SEC 为旧配置键，继续兼容；TCP_TEST_* 优先级更高
+LATENCY_COUNT = 4
+LATENCY_TIMEOUT_SEC = 2
+LATENCY_METHOD = "TCP"          # 延迟测试方式："TCP"（握手）或 "ICMP"（ping）
+TCP_TEST_PORT = 443
 CURL_TIMEOUT_SEC = 5
 SPEED_TEST_TIMEOUT = 20
 MAX_LATENCY_MS = 300.0
 MIN_SPEED_MBPS = 1.0
+
+# IPv6 两级扫描：实测同一 /48 内可达性与机房一致，/48 才是最小有效单元
+IPV6_TWO_STAGE = True
+IPV6_SCAN_PER_PREFIX = 1024       # 每个前缀随机采样多少个 /48 做探活（实测约 1% 可达）
+IPV6_SCAN_WORKERS = 128           # 探活并发（128 并发约 25s/千个 /48）
+IPV6_PROBE_PORT = 443             # 探活端口（80 命中率更高，443 更贴近代理用途）
+IPV6_PROBE_TIMEOUT = 1            # 秒；CF 边缘 RTT 通常 <200ms，1s 足够
+IPV6_MAX_REACHABLE = 64           # 每个前缀最多保留的可达 /48 数
+IPV6_PER_REACHABLE = 1            # 每个可达 /48 生成几个 /64 地址
 DEBUG = False
 LOG_FILE = None
 
@@ -167,6 +181,12 @@ def resolve_output_path(template, output_folder, date_str):
     _ensure_parent(s)
     return s
 
+def _curl_resolve_target(host, port, ip):
+    """构造 curl --resolve 的地址部分，IPv6 需要方括号。"""
+    if ":" in ip:  # IPv6
+        return f"{host}:{port}:[{ip}]"
+    return f"{host}:{port}:{ip}"
+
 
 # ==================== 配置读取 ====================
 def strip_comment(line):
@@ -258,9 +278,12 @@ def apply_config(cfg):
     global DEFAULT_CSV_OUTPUT, DEFAULT_IP_OUTPUT, OUTPUT_FOLDER_PATH
     global DEFAULT_THREADS, MAX_IO_THREADS, DEFAULT_SPEED_WORKERS
     global SPEED_TEST_URL, AVAILABILITY_URL, AVAILABILITY_HOST
-    global PING_COUNT, PING_TIMEOUT_SEC, CURL_TIMEOUT_SEC, SPEED_TEST_TIMEOUT
+    global LATENCY_COUNT, LATENCY_TIMEOUT_SEC, LATENCY_METHOD, TCP_TEST_PORT
+    global CURL_TIMEOUT_SEC, SPEED_TEST_TIMEOUT
     global MAX_LATENCY_MS, MIN_SPEED_MBPS, DEBUG, LOG_FILE
     global IPV4_SOURCE, IPV6_SOURCE
+    global IPV6_TWO_STAGE, IPV6_SCAN_PER_PREFIX, IPV6_SCAN_WORKERS
+    global IPV6_PROBE_PORT, IPV6_PROBE_TIMEOUT, IPV6_MAX_REACHABLE, IPV6_PER_REACHABLE
 
     if "DEFAULT_IP_OUTPUT" in cfg:
         DEFAULT_IP_OUTPUT = str(cfg["DEFAULT_IP_OUTPUT"])
@@ -303,14 +326,70 @@ def apply_config(cfg):
         AVAILABILITY_URL = str(cfg["AVAILABILITY_URL"])
     if "AVAILABILITY_HOST" in cfg:
         AVAILABILITY_HOST = str(cfg["AVAILABILITY_HOST"])
+    # 延迟测试：先读兼容键 PING_*，再由 TCP_TEST_* 覆盖
     if "PING_COUNT" in cfg:
         try:
-            PING_COUNT = int(cfg["PING_COUNT"])
+            LATENCY_COUNT = int(cfg["PING_COUNT"])
         except Exception:
             pass
     if "PING_TIMEOUT_SEC" in cfg:
         try:
-            PING_TIMEOUT_SEC = int(cfg["PING_TIMEOUT_SEC"])
+            LATENCY_TIMEOUT_SEC = int(cfg["PING_TIMEOUT_SEC"])
+        except Exception:
+            pass
+    if "TCP_TEST_COUNT" in cfg:
+        try:
+            LATENCY_COUNT = int(cfg["TCP_TEST_COUNT"])
+        except Exception:
+            pass
+    if "TCP_TEST_TIMEOUT_SEC" in cfg:
+        try:
+            LATENCY_TIMEOUT_SEC = int(cfg["TCP_TEST_TIMEOUT_SEC"])
+        except Exception:
+            pass
+    if "TCP_TEST_PORT" in cfg:
+        try:
+            TCP_TEST_PORT = int(cfg["TCP_TEST_PORT"])
+        except Exception:
+            pass
+    if "LATENCY_METHOD" in cfg:
+        _m = str(cfg.get("LATENCY_METHOD") or "").strip().upper()
+        if _m in ("TCP", "ICMP"):
+            LATENCY_METHOD = _m
+        else:
+            print(f"[!] 无效 LATENCY_METHOD={cfg.get('LATENCY_METHOD')!r}，"
+                  f"可选 ICMP / TCP，已回退 TCP", file=sys.stderr)
+            LATENCY_METHOD = "TCP"
+    if "IPV6_TWO_STAGE" in cfg:
+        IPV6_TWO_STAGE = bool(cfg["IPV6_TWO_STAGE"])
+    if "IPV6_SCAN_PER_PREFIX" in cfg:
+        try:
+            IPV6_SCAN_PER_PREFIX = int(cfg["IPV6_SCAN_PER_PREFIX"])
+        except Exception:
+            pass
+    if "IPV6_SCAN_WORKERS" in cfg:
+        try:
+            IPV6_SCAN_WORKERS = int(cfg["IPV6_SCAN_WORKERS"])
+        except Exception:
+            pass
+    if "IPV6_PROBE_PORT" in cfg:
+        try:
+            IPV6_PROBE_PORT = int(cfg["IPV6_PROBE_PORT"])
+        except Exception:
+            pass
+    if "IPV6_PROBE_TIMEOUT" in cfg:
+        try:
+            IPV6_PROBE_TIMEOUT = int(cfg["IPV6_PROBE_TIMEOUT"])
+        except Exception:
+            pass
+    if "IPV6_MAX_REACHABLE" in cfg:
+        try:
+            IPV6_MAX_REACHABLE = int(cfg["IPV6_MAX_REACHABLE"])
+        except Exception:
+            pass
+    if "IPV6_PER_REACHABLE" in cfg:
+        try:
+            IPV6_PER_REACHABLE = int(cfg["IPV6_PER_REACHABLE"])
         except Exception:
             pass
     if "CURL_TIMEOUT_SEC" in cfg:
@@ -372,6 +451,69 @@ def parse_cidrs(text):
     return cidrs
 
 
+def _probe_ipv6_48(base_net, idx48, port, timeout):
+    """探测一个 /48：随机取一个主机地址做 TCP 握手，返回 (是否可达, 地址)。"""
+    base48 = base_net + (idx48 << 80)
+    host = random.randint(1, (1 << 64) - 2)
+    addr = str(ipaddress.IPv6Address(base48 + host))
+    for _ in range(2):                     # 超时/丢包会造成假阴性，重试一次
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((addr, port, 0, 0))
+            return True, addr
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return False, addr
+
+
+def scan_ipv6_48(networks, workers=None, per_prefix=None, port=None, timeout=None):
+    """两级扫描第一级：按 /48 抽样探活，返回可达 /48 的网络地址（int 列表）。
+
+    实测同一 /48 内任意 /64 的可达性和机房都相同，因此以 /48 为最小探测单元，
+    避免按 /64 枚举（一个 /32 就有 42.9 亿个 /64）。
+    """
+    workers = IPV6_SCAN_WORKERS if workers is None else workers
+    per_prefix = IPV6_SCAN_PER_PREFIX if per_prefix is None else per_prefix
+    port = IPV6_PROBE_PORT if port is None else port
+    timeout = IPV6_PROBE_TIMEOUT if timeout is None else timeout
+
+    reachable = []
+    for net in networks:
+        if net.version != 6:
+            continue
+        total48 = 1 << max(0, 48 - net.prefixlen)
+        take = min(per_prefix, total48)
+        idxs = random.sample(range(total48), take)
+        base_net = int(net.network_address)
+        hits = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v6scan") as ex:
+            fmap = {ex.submit(_probe_ipv6_48, base_net, i, port, timeout): i for i in idxs}
+            for fut in as_completed(fmap):
+                done += 1
+                idx = fmap[fut]
+                try:
+                    ok, addr = fut.result()
+                except Exception:
+                    ok, addr = False, None
+                if ok:
+                    hits.append(idx)
+                    log("[v6scan %d/%d] %s 可达（累计 %d 个 /48）" % (done, take, addr, len(hits)))
+                    if len(hits) >= IPV6_MAX_REACHABLE:
+                        for f in fmap:
+                            f.cancel()
+                        break
+        log("[*] %s：采样 %d 个 /48 → 可达 %d" % (net, take, len(hits)))
+        reachable.extend(base_net + (i << 80) for i in hits)
+    return reachable
+
+
 def generate_test_ips(ip_version=None):
     """从 Cloudflare 官方 IP 段生成测试 IP。
 
@@ -396,24 +538,31 @@ def generate_test_ips(ip_version=None):
                 ips.append(str(ip))
 
     # ---- IPv6 ----
+    # 实测：同一 /48 内所有 /64 的机房与可达性一致，/48 才是最小有效单元。
+    # 一个 /32 有 65536 个 /48、42.9 亿个 /64，按 /64 枚举永远跑不完。
     if ip_version is None or ip_version == 6:
         v6_text = fetch_text(IPV6_SOURCE)
         v6_networks = parse_cidrs(v6_text)
-        for net in v6_networks:
-            if net.version != 6:
-                continue
-            # 将网络按 /64 划分（最小测试单元）
-            try:
-                for subnet in net.subnets(new_prefix=64):
-                    # 随机接口标识符（避免全零和广播）
-                    base = int(subnet.network_address)
-                    rand_part = random.randint(1, (1 << 64) - 2)
-                    ip_int = base + rand_part
-                    ip = ipaddress.IPv6Address(ip_int)
-                    ips.append(str(ip))
-            except ValueError:
-                # 如果网络小于 /64，直接跳过
-                continue
+        if IPV6_TWO_STAGE:
+            reachable48 = scan_ipv6_48(v6_networks)
+            per = max(1, IPV6_PER_REACHABLE)
+            for base48 in reachable48:
+                for _ in range(per):
+                    host = random.randint(1, (1 << 64) - 2)
+                    ips.append(str(ipaddress.IPv6Address(base48 + host)))
+            log("[*] IPv6 两级扫描：%d 个可达 /48 → %d 个测试地址"
+                % (len(reachable48), len(reachable48) * per))
+        else:
+            # 单级模式：每个前缀随机取 IPV6_SCAN_PER_PREFIX 个 /64 地址（不枚举）
+            for net in v6_networks:
+                if net.version != 6:
+                    continue
+                total64 = 1 << max(0, 64 - net.prefixlen)
+                base_net = int(net.network_address)
+                for _ in range(min(IPV6_SCAN_PER_PREFIX, total64)):
+                    idx = random.randrange(total64)
+                    host = random.randint(1, (1 << 64) - 2)
+                    ips.append(str(ipaddress.IPv6Address(base_net + (idx << 64) + host)))
 
     # 去重并打乱顺序，避免总是测试相同 IP
     ips = list(dict.fromkeys(ips))
@@ -428,7 +577,7 @@ def availability(ip, timeout=CURL_TIMEOUT_SEC):
         "curl", "-sS", "-k",
         "--connect-timeout", str(timeout),
         "--max-time", str(timeout),
-        "--resolve", f"{AVAILABILITY_HOST}:443:{ip}",
+        "--resolve", _curl_resolve_target(AVAILABILITY_HOST, 443, ip),
         AVAILABILITY_URL,
     ]
     ok, out = run_command(cmd, timeout + 3)
@@ -485,7 +634,10 @@ def extract_ms(output):
     vals = []
     for line in output.splitlines():
         low = line.lower()
-        if "average" in low or "平均" in line:
+        # 跳过汇总行：Linux 的 "4 packets transmitted ... time 3006ms" 与
+        # "rtt min/avg/max/mdev = ..." 里的数值不是单包延迟
+        if ("average" in low or "平均" in line or "transmitted" in low
+                or "min/avg" in low or "packet loss" in low):
             continue
         if re.search(r"(?:time|时间)\s*<\s*1\s*ms\b", line, re.I):
             vals.append(1.0)
@@ -500,13 +652,52 @@ def extract_ms(output):
 
 
 def ping_latency(ip):
+    """ICMP 延迟(ms)：调用系统 ping，取有效应答时间的平均值；无样本返回 None。"""
     if platform.system().lower() == "windows":
-        cmd = ["ping", "-n", str(PING_COUNT), "-w", str(PING_TIMEOUT_SEC * 1000), ip]
+        cmd = ["ping", "-n", str(LATENCY_COUNT),
+               "-w", str(int(LATENCY_TIMEOUT_SEC * 1000)), ip]
     else:
-        cmd = ["ping", "-c", str(PING_COUNT), "-W", str(PING_TIMEOUT_SEC), ip]
-    ok, out = run_command(cmd, PING_COUNT * PING_TIMEOUT_SEC + 3)
+        cmd = ["ping", "-c", str(LATENCY_COUNT),
+               "-W", str(int(LATENCY_TIMEOUT_SEC)), ip]
+    ok, out = run_command(cmd, LATENCY_COUNT * LATENCY_TIMEOUT_SEC + 3)
+    if not ok:
+        return None
     vals = extract_ms(out)
     return sum(vals) / len(vals) if vals else None
+
+
+def tcp_latency(ip, port=None, count=None, timeout=None):
+    """TCP 握手延迟(ms)：向 ip:port 发起 count 次三次握手，取成功次的平均值。
+
+    握手被拒/超时的那次不计入；全部失败返回 None（视为不可用）。
+    """
+    port = TCP_TEST_PORT if port is None else int(port)
+    count = max(1, LATENCY_COUNT if count is None else int(count))
+    timeout = LATENCY_TIMEOUT_SEC if timeout is None else float(timeout)
+
+    samples = []
+    for _ in range(count):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        try:
+            sock.connect((ip, port))
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return sum(samples) / len(samples) if samples else None
+
+
+def measure_latency(ip):
+    """按 LATENCY_METHOD 分派：ICMP 走系统 ping，TCP 走 443 三次握手。"""
+    if str(LATENCY_METHOD).upper() == "ICMP":
+        return ping_latency(ip)
+    return tcp_latency(ip)
 
 
 def speed_test(ip, bytes_to_download):
@@ -525,7 +716,7 @@ def speed_test(ip, bytes_to_download):
         "--max-time", str(SPEED_TEST_TIMEOUT),
     ]
     cmd += range_args
-    cmd += ["--resolve", f"{host}:443:{ip}", url]
+    cmd += ["--resolve", _curl_resolve_target(host, 443, ip), url]
 
     ok, out = run_command(cmd, SPEED_TEST_TIMEOUT + 5)
     if not ok:
@@ -540,9 +731,9 @@ def speed_test(ip, bytes_to_download):
 
 def speed_worker(item, speed_bytes, sem):
     ip = item["ip"]
-    latency = ping_latency(ip)
+    latency = measure_latency(ip)
     if latency is None:
-        return ip, None, "DROP: ping无有效ms响应"
+        return ip, None, f"DROP: {LATENCY_METHOD} 延迟无有效样本（{LATENCY_COUNT} 次全失败）"
     if latency > MAX_LATENCY_MS:
         return ip, None, f"DROP: latency {latency:.1f}ms > {MAX_LATENCY_MS:.0f}ms"
     with sem:
@@ -561,7 +752,7 @@ def stage2(items, threads, speed_bytes):
     done = 0
     out = []
     speed_workers = max(1, min(DEFAULT_SPEED_WORKERS, threads, total))
-    log(f"\n[*] 第二阶段：延迟+速度，{total} IP，任务线程 {threads}，下载并发 {speed_workers}")
+    log(f"\n[*] 第二阶段：{LATENCY_METHOD} 延迟+速度，{total} IP，任务线程 {threads}，下载并发 {speed_workers}")
     sem = threading.Semaphore(speed_workers)
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="speed") as ex:
         fmap = {ex.submit(speed_worker, x, speed_bytes, sem): x for x in items}
@@ -591,15 +782,78 @@ def sort_key(r):
             -float(r["speed"]), float(r["latency"]))
 
 
+# 完整国家名 → 双字母码（仅覆盖 Cloudflare colo 可能出现的国家）
+_COUNTRY_NAME_TO_CC = {
+    "SINGAPORE": "SG", "HONG KONG": "HK", "JAPAN": "JP", "SOUTH KOREA": "KR",
+    "KOREA": "KR", "TAIWAN": "TW", "CHINA": "CN", "UNITED STATES": "US",
+    "USA": "US", "CANADA": "CA", "UNITED KINGDOM": "GB", "UK": "GB",
+    "GERMANY": "DE", "FRANCE": "FR", "NETHERLANDS": "NL", "AUSTRALIA": "AU",
+    "INDIA": "IN", "BRAZIL": "BR", "RUSSIA": "RU", "ITALY": "IT",
+    "SPAIN": "ES", "SWEDEN": "SE", "SWITZERLAND": "CH", "POLAND": "PL",
+    "MEXICO": "MX", "ARGENTINA": "AR", "CHILE": "CL", "COLOMBIA": "CO",
+    "PERU": "PE", "SOUTH AFRICA": "ZA", "EGYPT": "EG", "TURKEY": "TR",
+    "UNITED ARAB EMIRATES": "AE", "SAUDI ARABIA": "SA", "ISRAEL": "IL",
+    "INDONESIA": "ID", "MALAYSIA": "MY", "THAILAND": "TH", "VIETNAM": "VN",
+    "PHILIPPINES": "PH", "NEW ZEALAND": "NZ", "IRELAND": "IE",
+    "PORTUGAL": "PT", "NORWAY": "NO", "DENMARK": "DK", "FINLAND": "FI",
+    "AUSTRIA": "AT", "BELGIUM": "BE", "CZECH REPUBLIC": "CZ", "CZECHIA": "CZ",
+    "GREECE": "GR", "HUNGARY": "HU", "ROMANIA": "RO", "UKRAINE": "UA",
+    "BULGARIA": "BG", "CROATIA": "HR", "SERBIA": "RS", "KAZAKHSTAN": "KZ",
+    "PAKISTAN": "PK", "BANGLADESH": "BD", "SRI LANKA": "LK", "NEPAL": "NP",
+    "OMAN": "OM", "QATAR": "QA", "KUWAIT": "KW", "BAHRAIN": "BH",
+    "JORDAN": "JO", "LEBANON": "LB", "IRAQ": "IQ", "IRAN": "IR",
+    "MOROCCO": "MA", "NIGERIA": "NG", "KENYA": "KE", "GHANA": "GH",
+    "TANZANIA": "TZ", "ETHIOPIA": "ET", "ANGOLA": "AO", "MOZAMBIQUE": "MZ",
+    "MADAGASCAR": "MG", "MAURITIUS": "MU", "REUNION": "RE",
+    "PUERTO RICO": "PR", "PANAMA": "PA", "COSTA RICA": "CR",
+    "GUATEMALA": "GT", "ECUADOR": "EC", "URUGUAY": "UY", "PARAGUAY": "PY",
+    "BOLIVIA": "BO", "VENEZUELA": "VE", "GUAM": "GU",
+    "BRUNEI": "BN", "CAMBODIA": "KH", "MONGOLIA": "MN", "MACAU": "MO",
+    "MACAO": "MO", "ICELAND": "IS", "LUXEMBOURG": "LU", "MALTA": "MT",
+    "CYPRUS": "CY", "ESTONIA": "EE", "LATVIA": "LV", "LITHUANIA": "LT",
+    "SLOVAKIA": "SK", "SLOVENIA": "SI", "BELARUS": "BY", "GEORGIA": "GE",
+    "ARMENIA": "AM", "AZERBAIJAN": "AZ", "UZBEKISTAN": "UZ",
+    "KYRGYZSTAN": "KG", "MOLDOVA": "MD", "ALBANIA": "AL",
+    "NORTH MACEDONIA": "MK", "BOSNIA AND HERZEGOVINA": "BA",
+    "MONTENEGRO": "ME", "TUNISIA": "TN", "ALGERIA": "DZ", "LIBYA": "LY",
+    "SUDAN": "SD", "SENEGAL": "SN", "IVORY COAST": "CI", "COTE D'IVOIRE": "CI",
+    "CAMEROON": "CM", "UGANDA": "UG", "ZAMBIA": "ZM", "ZIMBABWE": "ZW",
+    "BOTSWANA": "BW", "NAMIBIA": "NA", "RWANDA": "RW", "SOMALIA": "SO",
+    "AFGHANISTAN": "AF", "MYANMAR": "MM", "LAOS": "LA", "FIJI": "FJ",
+    "PAPUA NEW GUINEA": "PG", "NEW CALEDONIA": "NC", "TAHITI": "PF",
+    "BERMUDA": "BM", "BAHAMAS": "BS", "JAMAICA": "JM",
+    "TRINIDAD AND TOBAGO": "TT", "BARBADOS": "BB", "HAITI": "HT",
+    "DOMINICAN REPUBLIC": "DO", "EL SALVADOR": "SV", "HONDURAS": "HN",
+    "NICARAGUA": "NI", "CUBA": "CU", "GREENLAND": "GL",
+}
+
+
+def _to_cc(value):
+    """把国家字段归一化为双字母代码。"""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if re.fullmatch(r"[A-Za-z]{2}", v):
+        return v.upper()
+    return _COUNTRY_NAME_TO_CC.get(v.upper(), "")
+
+
 def get_colo_info(colo):
-    """根据 colo 代码查询 (country, city)。未命中返回 ("", "")。"""
+    """根据 colo 代码查询 (country, city)。
+
+    优先取映射表中的 cca2 字段（双字母码）；
+    否则取 country 字段并尝试转换为双字母码。
+    未命中返回 ("", "")。
+    """
     if not colo:
         return "", ""
     info = COLO_MAP.get(colo.upper())
-    if info:
-        return (info.get("country", "") or "",
-                info.get("city", "") or "")
-    return "", ""
+    if not info:
+        return "", ""
+
+    cc = _to_cc(info.get("cca2")) or _to_cc(info.get("country"))
+    city = info.get("city", "") or ""
+    return cc, city
 
 
 def outputs(results, outcsv, outtxt):
@@ -659,7 +913,7 @@ def main():
     cfg = load_config(config_path)
     apply_config(cfg)
 
-    p = argparse.ArgumentParser(description="Cloudflare SNI Proxy IP Tester (Auto IP)")
+    p = argparse.ArgumentParser(description="Cloudflare IP Tester (Auto IP)")
     p.add_argument("-threads", default=None,
                    help=f"测试延迟/速度的线程数，默认{DEFAULT_THREADS}，可填 max")
     p.add_argument("-o", "--output", default=None,
@@ -673,9 +927,11 @@ def main():
     p.add_argument("-debug", action="store_true",
                    help="调试模式：显示剔除原因及系统命令输出")
     p.add_argument("-v4", action="store_true",
-                   help="只测试 IPv4")
+                   help="只测试 IPv4（默认）")
     p.add_argument("-v6", action="store_true",
                    help="只测试 IPv6")
+    p.add_argument("-all", "--all", dest="all", action="store_true",
+                   help="同时测试 IPv4 和 IPv6（默认仅 IPv4）")
     a = p.parse_args()
 
     if a.debug:
@@ -688,15 +944,20 @@ def main():
 
     threads = parse_threads(a.threads if a.threads is not None else DEFAULT_THREADS)
 
+    if a.all and (a.v4 or a.v6):
+        print("[!] -all 不能与 -v4 / -v6 同时使用", file=sys.stderr)
+        sys.exit(2)
     if a.v4 and a.v6:
         print("[!] -v4 与 -v6 不能同时使用", file=sys.stderr)
         sys.exit(2)
-    if a.v4:
+    if a.all:
+        ip_version = None
+    elif a.v4:
         ip_version = 4
     elif a.v6:
         ip_version = 6
     else:
-        ip_version = None
+        ip_version = 4          # 默认只测 IPv4
 
     if downloadBytes <= 0:
         print("[!] downloadBytes必须大于0", file=sys.stderr)
@@ -722,23 +983,27 @@ def main():
 
     if a.output is not None:
         out_csv = a.output
-        # 解析 ip.txt 输出路径（仅从 config 获取，CLI 不提供此项）
-        out_ip = resolve_output_path(DEFAULT_IP_OUTPUT, output_folder, date_str)
         if not os.path.isabs(out_csv):
             out_csv = os.path.abspath(out_csv)
         _ensure_parent(out_csv)
     else:
         out_csv = resolve_output_path(DEFAULT_CSV_OUTPUT, output_folder, date_str)
 
+    # 解析 ip.txt 输出路径（仅从 config 获取，CLI 不提供此项）
+    out_ip = resolve_output_path(DEFAULT_IP_OUTPUT, output_folder, date_str)
+
+    ver_label = {None: "IPv4+IPv6", 4: "IPv4", 6: "IPv6"}[ip_version]
+
     log("=" * 60)
     log(f"OS={platform.system()} {platform.release()} threads={threads} "
         f"downloadBytes={downloadBytes}")
     log(f"output_folder = {output_folder}")
+    log(f"ip_output     = {out_ip}")
     log(f"csv_output    = {out_csv}")
     log(f"log_file      = {LOG_FILE}")
     log(f"ipv4_source   = {IPV4_SOURCE}")
     log(f"ipv6_source   = {IPV6_SOURCE}")
-    log(f"ip_output     = {out_ip}")
+    log(f"ip_version    = {ver_label}")
     log(f"colo_map      = {len(COLO_MAP)} 条")
     log("=" * 60)
 

@@ -13,10 +13,11 @@ The readme doc is only available in Chinese cuz only Chinese users need this scr
 **⚠请不要滥用这些IP及本工具，否则将导致此方法被封堵！**
 
 ## 环境要求 
-OS: Windows or Ubuntu（未测试）
+OS: Windows or Ubuntu
     With Python & tracepath/tracert/traceroute & curl & ping
 
-测试环境：Windows 11 with Python & tracert & curl & ping，只保证Windows环境下的可用性。
+测试环境：Windows 11 with Python & tracert & curl & ping、
+         Ubuntu 26.04 LTS with Python & traceroute & curl & ping
 
 ## 工作流程
 获取IP段，提取最小测试单元 -> 检查可用性 -> 测试延迟、速度 -> 筛选优质ip -> 生成 bestips-{date}.csv 以及 ip.txt
@@ -31,6 +32,9 @@ OS: Windows or Ubuntu（未测试）
 - -config 后面跟配置文件路径，例如config.ini（代表./config.ini）
 - -log 输出日志文件
 - -debug 调试模式（关掉会更快）
+- -v4 仅IPV4（默认启动参数，一般不用加，这个是为了服务某些脚本写-{type}之类的。）
+- -v6 仅IPV6（不建议！！！！！IPV6的命中率很低！）
+- -all 双栈（不建议，理由如上）
 
 ## 功能实现解析
 
@@ -39,14 +43,12 @@ curl -sS -k --connect-timeout {timeout} --max-time {timeout} --resolve {cf-host}
 有正确输出即为可用。当然，存在特殊情况。
 
 ### 测试延迟、速度
-ping ... {your-ip} 解析返回延迟
-curl -w %{speed_download} ... {large-file-url}
+延迟：ICMP / TCP Ping
+速度：curl -w %{speed_download} ... {large-file-url}
 
 ## ip.txt 输出结果示例
-```text
 1.2.3.4#🇯🇵 Tokyo 1
 5.6.7.8#🇯🇵 Tokyo 2
-```
 
 ## csv输出示例
 
