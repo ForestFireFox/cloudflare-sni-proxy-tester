@@ -12,6 +12,8 @@ The readme doc is only available in Chinese cuz only Chinese users need this scr
 
 本人因为自身原因没法管这个项目，故不接受任何PR。你可以fork这个项目，改完把仓库地址发在issue中。
 
+子项目：CF官方优选脚本，代码在分支
+
 **⚠本条道路属于见光死类型，如果你想让这条路活得得久一点，就不要滥用本项目和优质反代ip！**
 
 请你把反代ip想象成某种程度上的公共资源：你在用，别人也在用。
@@ -19,10 +21,11 @@ The readme doc is only available in Chinese cuz only Chinese users need this scr
 所以不要长时间、大流量滥用单个反代ip，比如拿去开机场。
 
 ## 环境要求 
-OS: Windows or Ubuntu（未测试）
+OS: Windows or Ubuntu
     With Python & tracepath/tracert/traceroute & curl & ping
 
-测试环境：Windows 11 with Python & tracert & curl & ping，只保证Windows环境下的可用性。
+测试环境：Windows 11 with Python & tracert & curl & ping、
+         Ubuntu 26.04 LTS with Python & traceroute & curl & ping
 
 ## 工作流程
 导入ip csv -> 提取ip并去重 -> 检查可用性 -> 测试延迟、速度 -> 筛选优质ip -> 使用ipinfo查询ip本身对应国家 -> traceroute分析线路 -> 生成 bestips-{date}.csv 以及 ip.txt
@@ -70,10 +73,8 @@ traceroute/tracert/tracepath {your-ip}
 （ip列必须存在，存在其他输入也无所谓。）
 
 ## ip.txt 输出结果示例
-```text
 1.2.3.4#JP (CN2) Tokyo 1 //电信示例1
-5.6.7.8#JP (163绕🇭🇰、🇺🇸) Tokyo 2 //电信示例2
-```
+5.6.7.8#JP (163绕HK、US) Tokyo 2 //电信示例2
 
 ## csv输出示例
 | route | ip          | cfcountry | tour  | country | city      | speed    | latency |
@@ -87,11 +88,11 @@ traceroute/tracert/tracepath {your-ip}
 排列优先级：previousCountry对应的国家 -> 速度降序；把cfcountry一致的ip归类到了一块排序
 
 表头字段注释：
-- route：判断的线路类型
-- ip：ip
-- cfcountry：数据中心colo映射出的国家代码。
-- tour：绕路情况，没绕填充None，绕路按照上述格式填充，例：HK→JP
+route：判断的线路类型
+ip：ip
+cfcountry：访问/cdn-cgi/trace对应的国家/地区代码，该字段可以填充HK。
+tour：绕路情况，没绕填充None，绕路按照上述格式填充，例：HK→JP
 country：这个ip本身对应的国家
 city：这个ip对应的城市
 speed：这个ip的速度
-latency：这个ip的延迟
+delay：这个ip的延迟

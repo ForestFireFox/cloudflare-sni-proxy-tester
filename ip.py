@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Cloudflare SNI Proxy IP Tester - Windows/Ubuntu."""
-import argparse, csv, ipaddress, json, os, platform, re, subprocess, sys, threading, time, urllib.request
+import argparse, csv, ipaddress, json, os, platform, re, socket, subprocess, sys, threading, time, urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -27,8 +27,12 @@ SPEED_TEST_URL = "https://speed.cloudflare.com/__down?during=download&bytes={byt
 AVAILABILITY_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 AVAILABILITY_HOST = "www.cloudflare.com"
 
-PING_COUNT = 4
-PING_TIMEOUT_SEC = 2
+# 延迟测试：TCP 三次握手（比 ICMP 更贴近真实链路，也不怕被防火墙丢弃）
+# PING_COUNT / PING_TIMEOUT_SEC 为旧配置键，继续兼容；TCP_TEST_* 优先级更高
+LATENCY_COUNT = 4
+LATENCY_TIMEOUT_SEC = 2
+TCP_TEST_PORT = 443
+LATENCY_METHOD = "TCP"          # 延迟测试方式："TCP"（握手）或 "ICMP"（ping）
 CURL_TIMEOUT_SEC = 5
 SPEED_TEST_TIMEOUT = 20
 MAX_LATENCY_MS = 300.0
@@ -281,7 +285,8 @@ def apply_config(cfg):
     global DEFAULT_INPUT, DEFAULT_IP_OUTPUT, DEFAULT_CSV_OUTPUT, OUTPUT_FOLDER_PATH
     global DEFAULT_THREADS, MAX_IO_THREADS, DEFAULT_SPEED_WORKERS
     global SPEED_TEST_URL, AVAILABILITY_URL, AVAILABILITY_HOST
-    global PING_COUNT, PING_TIMEOUT_SEC, CURL_TIMEOUT_SEC, SPEED_TEST_TIMEOUT
+    global LATENCY_COUNT, LATENCY_TIMEOUT_SEC, TCP_TEST_PORT, LATENCY_METHOD
+    global CURL_TIMEOUT_SEC, SPEED_TEST_TIMEOUT
     global MAX_LATENCY_MS, MIN_SPEED_MBPS, TRACEROUTE_TIMEOUT, DEBUG, LOG_FILE
     global ROUTE_CACHE_FILE, ROUTE_CACHE_PREFIXLEN, IP_OVERRIDE_FILE
 
@@ -336,16 +341,40 @@ def apply_config(cfg):
         AVAILABILITY_URL = str(cfg["AVAILABILITY_URL"])
     if "AVAILABILITY_HOST" in cfg:
         AVAILABILITY_HOST = str(cfg["AVAILABILITY_HOST"])
+    # 延迟测试：先读兼容键 PING_*，再由 TCP_TEST_* 覆盖
     if "PING_COUNT" in cfg:
         try:
-            PING_COUNT = int(cfg["PING_COUNT"])
+            LATENCY_COUNT = int(cfg["PING_COUNT"])
         except Exception:
             pass
     if "PING_TIMEOUT_SEC" in cfg:
         try:
-            PING_TIMEOUT_SEC = int(cfg["PING_TIMEOUT_SEC"])
+            LATENCY_TIMEOUT_SEC = int(cfg["PING_TIMEOUT_SEC"])
         except Exception:
             pass
+    if "TCP_TEST_COUNT" in cfg:
+        try:
+            LATENCY_COUNT = int(cfg["TCP_TEST_COUNT"])
+        except Exception:
+            pass
+    if "TCP_TEST_TIMEOUT_SEC" in cfg:
+        try:
+            LATENCY_TIMEOUT_SEC = int(cfg["TCP_TEST_TIMEOUT_SEC"])
+        except Exception:
+            pass
+    if "TCP_TEST_PORT" in cfg:
+        try:
+            TCP_TEST_PORT = int(cfg["TCP_TEST_PORT"])
+        except Exception:
+            pass
+    if "LATENCY_METHOD" in cfg:
+        _m = str(cfg.get("LATENCY_METHOD") or "").strip().upper()
+        if _m in ("TCP", "ICMP"):
+            LATENCY_METHOD = _m
+        else:
+            print(f"[!] 无效 LATENCY_METHOD={cfg.get('LATENCY_METHOD')!r}，"
+                  f"可选 ICMP / TCP，已回退 TCP", file=sys.stderr)
+            LATENCY_METHOD = "TCP"
     if "CURL_TIMEOUT_SEC" in cfg:
         try:
             CURL_TIMEOUT_SEC = int(cfg["CURL_TIMEOUT_SEC"])
@@ -471,6 +500,12 @@ def load_ip_override(path):
             n += 1
         return n
 
+# 修正ipv6 curl调用
+def _curl_resolve_target(host, port, ip):
+    """构造 curl --resolve 的地址部分，IPv6 需要方括号。"""
+    if ":" in ip:  # IPv6
+        return f"{host}:{port}:[{ip}]"
+    return f"{host}:{port}:{ip}"
 
 def override_for(ip):
     """返回命中覆盖规则的字段字典；未命中返回 None。"""
@@ -666,7 +701,7 @@ def availability(ip, timeout=CURL_TIMEOUT_SEC):
     cmd = ["curl", "-sS", "-k",
            "--connect-timeout", str(timeout),
            "--max-time", str(timeout),
-           "--resolve", f"{AVAILABILITY_HOST}:443:{ip}",
+           "--resolve", _curl_resolve_target(AVAILABILITY_HOST, 443, ip),
            AVAILABILITY_URL]
     ok, out = run_command(cmd, timeout + 3)
     if not ok:
@@ -721,7 +756,10 @@ def extract_ms(output):
     vals = []
     for line in output.splitlines():
         low = line.lower()
-        if "average" in low or "平均" in line:
+        # 跳过汇总行：Linux 的 "4 packets transmitted ... time 3006ms" 与
+        # "rtt min/avg/max/mdev = ..." 里的数值不是单包延迟
+        if ("average" in low or "平均" in line or "transmitted" in low
+                or "min/avg" in low or "packet loss" in low):
             continue
         if re.search(r"(?:time|时间)\s*<\s*1\s*ms\b", line, re.I):
             vals.append(1.0)
@@ -736,13 +774,55 @@ def extract_ms(output):
 
 
 def ping_latency(ip):
+    """ICMP 延迟(ms)：调用系统 ping，取有效应答时间的平均值；无样本返回 None。"""
     if platform.system().lower() == "windows":
-        cmd = ["ping", "-n", str(PING_COUNT), "-w", str(PING_TIMEOUT_SEC * 1000), ip]
+        cmd = ["ping", "-n", str(LATENCY_COUNT),
+               "-w", str(int(LATENCY_TIMEOUT_SEC * 1000)), ip]
     else:
-        cmd = ["ping", "-c", str(PING_COUNT), "-W", str(PING_TIMEOUT_SEC), ip]
-    ok, out = run_command(cmd, PING_COUNT * PING_TIMEOUT_SEC + 3)
+        cmd = ["ping", "-c", str(LATENCY_COUNT),
+               "-W", str(int(LATENCY_TIMEOUT_SEC)), ip]
+    ok, out = run_command(cmd, LATENCY_COUNT * LATENCY_TIMEOUT_SEC + 3)
+    if not ok:
+        return None
     vals = extract_ms(out)
     return sum(vals) / len(vals) if vals else None
+
+
+def tcp_latency(ip, port=None, count=None, timeout=None):
+    """TCP 握手延迟(ms)：向 ip:port 发起 count 次三次握手，取成功次的平均值。
+
+    ICMP 常被中间设备丢弃或限速（跨境线路尤其明显），因此改用
+    TCP SYN→SYN/ACK 的往返时间作为延迟指标；握手被拒/超时的那次不计入，
+    全部失败返回 None（该 IP 视为不可用）。
+    """
+    port = TCP_TEST_PORT if port is None else int(port)
+    count = max(1, LATENCY_COUNT if count is None else int(count))
+    timeout = LATENCY_TIMEOUT_SEC if timeout is None else float(timeout)
+
+    samples = []
+    for _ in range(count):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        try:
+            sock.connect((ip, port))
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        except OSError:
+            # 连接被拒/超时：这一次不计入延迟样本
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return sum(samples) / len(samples) if samples else None
+
+
+def measure_latency(ip):
+    """按 LATENCY_METHOD 分派：ICMP 走系统 ping，TCP 走 443 三次握手。"""
+    if str(LATENCY_METHOD).upper() == "ICMP":
+        return ping_latency(ip)
+    return tcp_latency(ip)
 
 
 def speed_test(ip, bytes_to_download):
@@ -760,7 +840,7 @@ def speed_test(ip, bytes_to_download):
            "--connect-timeout", str(CURL_TIMEOUT_SEC),
            "--max-time", str(SPEED_TEST_TIMEOUT)]
     cmd += range_args
-    cmd += ["--resolve", f"{host}:443:{ip}", url]
+    cmd += ["--resolve", _curl_resolve_target(host, 443, ip), url]
 
     ok, out = run_command(cmd, SPEED_TEST_TIMEOUT + 5)
     if not ok:
@@ -775,9 +855,9 @@ def speed_test(ip, bytes_to_download):
 
 def speed_worker(item, speed_bytes, sem):
     ip = item["ip"]
-    latency = ping_latency(ip)
+    latency = measure_latency(ip)
     if latency is None:
-        return ip, None, "DROP: ping无有效ms响应"
+        return ip, None, f"DROP: {LATENCY_METHOD} 延迟无有效样本（{LATENCY_COUNT} 次全失败）"
     if latency > MAX_LATENCY_MS:
         return ip, None, f"DROP: latency {latency:.1f}ms > {MAX_LATENCY_MS:.0f}ms"
     with sem:
@@ -796,7 +876,8 @@ def stage2(items, threads, speed_bytes):
     done = 0
     out = []
     speed_workers = max(1, min(DEFAULT_SPEED_WORKERS, threads, total))
-    log(f"\n[*] 第二阶段：延迟+速度，{total} IP，任务线程 {threads}，下载并发 {speed_workers}")
+    log(f"\n[*] 第二阶段：{LATENCY_METHOD} 延迟(×{LATENCY_COUNT})+速度，{total} IP，"
+        f"任务线程 {threads}，下载并发 {speed_workers}")
     sem = threading.Semaphore(speed_workers)
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="speed") as ex:
         fmap = {ex.submit(speed_worker, x, speed_bytes, sem): x for x in items}
@@ -1186,8 +1267,10 @@ def main():
     n_cache = load_route_cache(ROUTE_CACHE_FILE)
 
     log("=" * 60)
-    log(f"OS={platform.system()} {platform.release()} threads={threads} "
+    log(f"OS={platform.system()} {platform.release()} threads={threads} latency={LATENCY_METHOD} "
         f"downloadBytes={downloadBytes} skiptr={a.skiptr}")
+    log(f"latency_test  = TCP :{TCP_TEST_PORT} × {LATENCY_COUNT} 次，"
+        f"单次超时 {LATENCY_TIMEOUT_SEC}s，上限 {MAX_LATENCY_MS:.0f}ms")
     log(f"output_folder = {output_folder}")
     log(f"ip_output     = {out_ip}")
     log(f"csv_output    = {out_csv}")
